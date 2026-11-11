@@ -1,0 +1,836 @@
+// qmc5883l_tests — the driver over a double of the part: a register file that
+// answers on an I2C bus the way QST's data sheet (Rev. 1.0, §§ 9, 11 and 12)
+// says a QMC5883L does, so the data registers and the protection that a read of
+// them starts, the status flags, the pointer roll-over, the soft reset that
+// clears the SET/RESET period, and the bring-up are checked on the host, one
+// transaction at a time.  The log keeps what the controller sent, in a form the
+// tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C read
+// is 2, the address, the register, the count, -1.  The writes that reach a
+// register are also kept apart, as the register and the byte, so a bring-up is
+// compared without the reads between its writes.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, TimerAsync, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_mag.{ MagNanoT, Magnetometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use qmc5883l
+use qmc5883l.{ Qmc5883l, QmcRange, QmcMode, Qmc5883lPort }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state: 4 1 when a part is
+// there, 22 the I2C clock, 43 the reads of CTRL2 left before the soft reset bit
+// clears, 44 how many reads that is (-1 for never), 50 the reads of STATUS that
+// answer without DRDY, 70 the transactions the part answers before it goes
+// silent (0 for no limit), 71 the transactions used, 80 the writes kept and 99
+// the entries in the log.  `ro` lists registers that ignore a write.  `log` is
+// the log and `wl` the writes.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    wl: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The chip as after power-on: standby, every control register 0, the chip id in
+// place.
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        wl: HashMap.new() }
+    c.regs.insert(0x0D, 0xFF)
+    c.st.insert(4, 1)
+    c
+
+// Appends a value to the log.
+@tier(app)
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+@tier(app)
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// Whether the part answers this transaction: it is there, and it has not used
+// the transactions it was allowed.
+@tier(app)
+fn present(c: Chip) -> Bool
+    if at(c.st, 4) == 0
+        return false
+    let lim = at(c.st, 70)
+    if lim == 0
+        return true
+    let used = at(c.st, 71) + 1
+    c.st.insert(71, used)
+    used <= lim
+
+// A register as the part answers it.  CTRL2 shows the soft reset bit for as many
+// reads as the test set.  STATUS answers without DRDY for as many reads as the
+// test set.  A read of a data register clears DRDY and DOR after it.
+@tier(app)
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x0A and at(c.st, 43) != 0
+        if at(c.st, 43) > 0
+            c.st.insert(43, at(c.st, 43) - 1)
+        return at(c.regs, 0x0A) | 0x80
+    if reg == 0x06 and at(c.st, 50) > 0
+        c.st.insert(50, at(c.st, 50) - 1)
+        return at(c.regs, 0x06) & 0xFE
+    let v = at(c.regs, reg)
+    if reg <= 0x05
+        c.regs.insert(0x06, at(c.regs, 0x06) & 0xFA)
+    v
+
+// A write to a register, which a read-only one ignores.  CTRL2's soft reset bit
+// resets the control registers, the SET/RESET period among them, and shows
+// itself for as many reads as the test set.
+@tier(app)
+fn chip_write(c: Chip, reg: Int, v: Int)
+    let n = at(c.st, 80)
+    c.wl.insert(n * 2, reg)
+    c.wl.insert(n * 2 + 1, v & 0xFF)
+    c.st.insert(80, n + 1)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x0A and (v & 0x80) != 0
+        c.regs.insert(0x09, 0)
+        c.regs.insert(0x0A, 0)
+        c.regs.insert(0x0B, 0)
+        var reads = at(c.st, 44)
+        if reads < 0
+            reads = -1
+        c.st.insert(43, reads)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    @tier(app)
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != 0x0D or not present(self.c) or data.len() < 2
+            return false
+        var r = data[0] as Int & 0x7F
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    // The address advances after each byte; with CTRL2's ROL_PNT set a read
+    // that begins at 0x00 to 0x06 wraps from 0x06 to 0x00.
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != 0x0D or not present(self.c)
+            return None
+        var r = tx[0] as Int & 0x7F
+        let roll = (at(self.c.regs, 0x0A) & 0x40) != 0 and r <= 6
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + 1
+            if roll and r == 7
+                r = 0
+        Some(out)
+
+// The GPIO double.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The port, as a type that holds a bus implements it: every method is the
+// package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Qmc5883lPort for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        qmc5883l.i2c_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        qmc5883l.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        qmc5883l.i2c_write(self.bus, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        qmc5883l.irq_level_of(self.pins, self.w)
+
+// The board's wiring: the part at 0x0D on I2C, DRDY on pin 65.
+@tier(app)
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x0D), 65)
+
+@tier(app)
+fn dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// The number of transactions in the log.
+@tier(app)
+fn transactions(c: Chip) -> Int
+    var n = 0
+    for i in 0..at(c.st, 99)
+        if at(c.log, i) == -1
+            n = n + 1
+    n
+
+// Asserts the writes that reached the part are `want`, as register and byte
+// pairs, then forgets them.
+@tier(app)
+fn writes_are(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 80) * 2, want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.wl, i), want[i])
+    c.st.insert(80, 0)
+
+@tier(app)
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Sets the 16-bit count of a data register pair, low byte first, at `reg`.
+@tier(app)
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u & 0xFF)
+    c.regs.insert(reg + 1, u >> 8)
+
+// Sets the three axes.
+@tier(app)
+fn put_xyz(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x00, x)
+    put16(c, 0x02, y)
+    put16(c, 0x04, z)
+
+@tier(app)
+fn x_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.x
+        None    => -99999999
+
+@tier(app)
+fn y_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.y
+        None    => -99999999
+
+@tier(app)
+fn z_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.z
+        None    => -99999999
+
+@tier(app)
+fn is_none(o: ?MagNanoT) -> Bool
+    match o
+        Some(_) => false
+        None    => true
+
+@tier(app)
+fn milli_of(o: ?TempMilliC) -> Int
+    match o
+        Some(t) => t.milli_c
+        None    => -99999999
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_read_of_one_register_sends_the_bare_register() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(qmc5883l.reg_read(d, 0x0D) ?? -1, 0xFF)
+    log_is(c, [2, 0x0D, 0x0D, 1, -1])
+
+@test
+fn test_a_read_of_a_run_has_no_increment_bit_because_the_address_advances_by_itself() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x00, 11)
+    c.regs.insert(0x01, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x00, 2, var b))
+    log_is(c, [2, 0x0D, 0x00, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_a_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.write_reg(0x0B, 0x01))
+    log_is(c, [1, 0x0D, 0x0B, 0x01, -1])
+    test.assert_eq(reg_of(c, 0x0B), 1)
+
+@test
+fn test_a_missing_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = dut(c)
+    test.assert(qmc5883l.reg_read(d, 0x0D) == None)
+    test.assert(not d.write_reg(0x0B, 1))
+    test.assert(not qmc5883l.reg_write(d, 0x0B, 1))
+    test.assert(qmc5883l.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: w }
+    test.assert(not d.setup())
+    test.assert(not qmc5883l.start(d))
+    log_is(c, [])
+
+@test
+fn test_setup_makes_the_ready_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_the_ready_line_level() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(d.irq_level(), 0)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    let bare = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x0D) }
+    test.assert_eq(bare.irq_level(), -1)
+
+@test
+fn test_the_identity_is_the_chip_id() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let id = qmc5883l.id_read(d) ?? DeviceId { who: -1, rev: None }
+    test.assert_eq(id.who, 0xFF)
+    test.assert(id.rev == None)
+    c.regs.insert(0x0D, 0x80)
+    test.assert_eq((qmc5883l.id_read(d) ?? DeviceId { who: -1, rev: None }).who, 0x80)
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_the_range_bits_round_trip() [io, hw]
+    test.assert(qmc5883l.range_of_ctrl1(0x00) == QmcRange.QmcRange2G)
+    test.assert(qmc5883l.range_of_ctrl1(0x0F) == QmcRange.QmcRange2G)
+    test.assert(qmc5883l.range_of_ctrl1(0x10) == QmcRange.QmcRange8G)
+    test.assert(qmc5883l.range_of_ctrl1(0x1D) == QmcRange.QmcRange8G)
+    // The reserved codes read as the larger range.
+    test.assert(qmc5883l.range_of_ctrl1(0x20) == QmcRange.QmcRange8G)
+    test.assert(qmc5883l.range_of_ctrl1(0x30) == QmcRange.QmcRange8G)
+    test.assert_eq(qmc5883l.rng_of_range(QmcRange.QmcRange2G), 0)
+    test.assert_eq(qmc5883l.rng_of_range(QmcRange.QmcRange8G), 1)
+
+@test
+fn test_the_sensitivity_is_the_data_sheet_s_counts_per_gauss() [io, hw]
+    test.assert_eq(qmc5883l.counts_per_gauss(QmcRange.QmcRange2G), 12000)
+    test.assert_eq(qmc5883l.counts_per_gauss(QmcRange.QmcRange8G), 3000)
+    // One gauss is 100 000 nanotesla at both ranges.
+    test.assert_eq(qmc5883l.nano_t_of(12000, QmcRange.QmcRange2G), 100000)
+    test.assert_eq(qmc5883l.nano_t_of(3000, QmcRange.QmcRange8G), 100000)
+    // A count is 8.33 nT at ±2 gauss and 33.3 nT at ±8, rounded toward zero.
+    test.assert_eq(qmc5883l.nano_t_of(1, QmcRange.QmcRange2G), 8)
+    test.assert_eq(qmc5883l.nano_t_of(-1, QmcRange.QmcRange2G), -8)
+    test.assert_eq(qmc5883l.nano_t_of(1, QmcRange.QmcRange8G), 33)
+    test.assert_eq(qmc5883l.nano_t_of(-1, QmcRange.QmcRange8G), -33)
+    // The saturated counts.
+    test.assert_eq(qmc5883l.nano_t_of(32767, QmcRange.QmcRange2G), 273058)
+    test.assert_eq(qmc5883l.nano_t_of(-32768, QmcRange.QmcRange2G), -273066)
+
+@test
+fn test_the_mode_the_rate_and_the_oversampling_follow_their_fields() [io, hw]
+    test.assert(qmc5883l.mode_of_ctrl1(0x00) == QmcMode.QmcStandby)
+    test.assert(qmc5883l.mode_of_ctrl1(0x01) == QmcMode.QmcContinuous)
+    test.assert(qmc5883l.mode_of_ctrl1(0x02) == QmcMode.QmcStandby)
+    test.assert(qmc5883l.mode_of_ctrl1(0x03) == QmcMode.QmcStandby)
+    test.assert(qmc5883l.mode_of_ctrl1(0x1D) == QmcMode.QmcContinuous)
+    test.assert_eq(qmc5883l.rate_hz_of_ctrl1(0x01), 10)
+    test.assert_eq(qmc5883l.rate_hz_of_ctrl1(0x05), 50)
+    test.assert_eq(qmc5883l.rate_hz_of_ctrl1(0x09), 100)
+    test.assert_eq(qmc5883l.rate_hz_of_ctrl1(0x0D), 200)
+    test.assert_eq(qmc5883l.osr_of_ctrl1(0x00), 512)
+    test.assert_eq(qmc5883l.osr_of_ctrl1(0x40), 256)
+    test.assert_eq(qmc5883l.osr_of_ctrl1(0x80), 128)
+    test.assert_eq(qmc5883l.osr_of_ctrl1(0xC0), 64)
+
+@test
+fn test_a_requested_rate_and_ratio_round_up() [io, hw]
+    test.assert_eq(qmc5883l.odr_for_rate(0), 0)
+    test.assert_eq(qmc5883l.odr_for_rate(10), 0)
+    test.assert_eq(qmc5883l.odr_for_rate(11), 1)
+    test.assert_eq(qmc5883l.odr_for_rate(50), 1)
+    test.assert_eq(qmc5883l.odr_for_rate(51), 2)
+    test.assert_eq(qmc5883l.odr_for_rate(100), 2)
+    test.assert_eq(qmc5883l.odr_for_rate(101), 3)
+    test.assert_eq(qmc5883l.odr_for_rate(9999), 3)
+    test.assert_eq(qmc5883l.osr_code_for(1), 3)
+    test.assert_eq(qmc5883l.osr_code_for(64), 3)
+    test.assert_eq(qmc5883l.osr_code_for(65), 2)
+    test.assert_eq(qmc5883l.osr_code_for(128), 2)
+    test.assert_eq(qmc5883l.osr_code_for(129), 1)
+    test.assert_eq(qmc5883l.osr_code_for(256), 1)
+    test.assert_eq(qmc5883l.osr_code_for(257), 0)
+    test.assert_eq(qmc5883l.osr_code_for(9999), 0)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_at_2_gauss_is_one_burst_of_ten_registers() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x01)
+    put_xyz(c, 12000, -6000, 3)
+    let a = qmc5883l.sample_read(d)
+    log_is(c, [2, 0x0D, 0x00, 10, -1])
+    test.assert_eq(x_of(a), 100000)
+    test.assert_eq(y_of(a), -50000)
+    test.assert_eq(z_of(a), 25)
+
+@test
+fn test_a_sample_is_converted_at_the_range_it_was_taken_in() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // The data sheet's example setting, 0x1D: 512 samples, ±8 gauss, 200 Hz,
+    // continuous.
+    c.regs.insert(0x09, 0x1D)
+    put_xyz(c, 3000, -1500, 3)
+    let a = qmc5883l.sample_read(d)
+    test.assert_eq(x_of(a), 100000)
+    test.assert_eq(y_of(a), -50000)
+    test.assert_eq(z_of(a), 100)
+    c.regs.insert(0x09, 0x0D)
+    test.assert_eq(x_of(qmc5883l.sample_read(d)), 25000)
+
+@test
+fn test_a_saturated_count_reads_as_the_count_it_saturated_at() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    put_xyz(c, 32767, -32768, 0)
+    c.regs.insert(0x06, 0x02)
+    let a = qmc5883l.sample_read(d)
+    test.assert_eq(x_of(a), 273058)
+    test.assert_eq(y_of(a), -273066)
+    test.assert(qmc5883l.overflow_read(d))
+    c.regs.insert(0x06, 0x00)
+    test.assert(not qmc5883l.overflow_read(d))
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = dut(c)
+    test.assert(is_none(qmc5883l.sample_read(d)))
+    test.assert(not qmc5883l.sample_ready(d))
+    test.assert_eq(qmc5883l.status_read(d), 0)
+    test.assert(not qmc5883l.overflow_read(d))
+
+@test
+fn test_the_status_flags() [io, hw]
+    test.assert(qmc5883l.status_ready(0x01))
+    test.assert(not qmc5883l.status_ready(0x06))
+    test.assert(qmc5883l.status_overflow(0x02))
+    test.assert(not qmc5883l.status_overflow(0x05))
+    test.assert(qmc5883l.status_missed(0x04))
+    test.assert(not qmc5883l.status_missed(0x03))
+
+@test
+fn test_ready_is_read_from_status_which_does_not_clear_it_but_a_data_read_does() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not qmc5883l.sample_ready(d))
+    c.regs.insert(0x06, 0x05)
+    test.assert(qmc5883l.sample_ready(d))
+    test.assert(qmc5883l.sample_ready(d))
+    test.assert_eq(qmc5883l.status_read(d), 0x05)
+    // A read of the data clears DRDY and DOR.
+    let _ = qmc5883l.sample_read(d)
+    test.assert(not qmc5883l.sample_ready(d))
+    test.assert_eq(qmc5883l.status_read(d), 0)
+
+@test
+fn test_with_the_pointer_roll_over_set_a_burst_past_status_would_return_the_data_twice() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x1D)
+    c.regs.insert(0x0A, 0x40)
+    put_xyz(c, 3000, 0, 0)
+    c.regs.insert(0x07, 0xE8)
+    c.regs.insert(0x08, 0x03)
+    // The ten-register read comes back as 0x00 to 0x06 and 0x00 to 0x03: CTRL1
+    // is never reached, so the driver leaves ROL_PNT clear.
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x00, 10, var b))
+    test.assert_eq(b[7] as Int, b[0] as Int)
+    test.assert_eq(b[9] as Int, b[2] as Int)
+
+// ── Settings ─────────────────────────────────────────────────────────
+
+@test
+fn test_an_update_changes_only_the_bits_of_its_mask() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0xAA)
+    test.assert(qmc5883l.reg_update(d, 0x09, 0x0F, 0xFF))
+    test.assert_eq(reg_of(c, 0x09), 0xAF)
+    test.assert(qmc5883l.reg_update(d, 0x09, 0xF0, 0x00))
+    test.assert_eq(reg_of(c, 0x09), 0x0F)
+    c.ro.insert(0x09, 1)
+    test.assert(not qmc5883l.reg_update(d, 0x09, 0xF0, 0xF0))
+    c.st.insert(4, 0)
+    test.assert(not qmc5883l.reg_update(d, 0x09, 0xF0, 0xF0))
+
+@test
+fn test_the_range_is_bits_5_and_4_and_leaves_the_rate_alone() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // 50 Hz, continuous.
+    c.regs.insert(0x09, 0x05)
+    test.assert(qmc5883l.range_write(d, QmcRange.QmcRange8G))
+    test.assert_eq(reg_of(c, 0x09), 0x15)
+    test.assert(qmc5883l.range_read(d) == QmcRange.QmcRange8G)
+    test.assert(qmc5883l.range_write(d, QmcRange.QmcRange2G))
+    test.assert_eq(reg_of(c, 0x09), 0x05)
+    c.ro.insert(0x09, 1)
+    test.assert(not qmc5883l.range_write(d, QmcRange.QmcRange8G))
+    c.st.insert(4, 0)
+    test.assert(qmc5883l.range_read(d) == QmcRange.QmcRange2G)
+
+@test
+fn test_the_mode_is_written_leaving_the_other_fields() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x9C)
+    test.assert(qmc5883l.mode_write(d, QmcMode.QmcContinuous))
+    test.assert_eq(reg_of(c, 0x09), 0x9D)
+    test.assert(qmc5883l.mode_read(d) == QmcMode.QmcContinuous)
+    test.assert(qmc5883l.mode_write(d, QmcMode.QmcStandby))
+    test.assert_eq(reg_of(c, 0x09), 0x9C)
+    test.assert(qmc5883l.mode_read(d) == QmcMode.QmcStandby)
+    c.st.insert(4, 0)
+    test.assert(not qmc5883l.mode_write(d, QmcMode.QmcStandby))
+    test.assert(qmc5883l.mode_read(d) == QmcMode.QmcStandby)
+
+@test
+fn test_the_rate_is_written_leaving_the_mode_and_read_only_in_continuous_mode() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x10)
+    test.assert_eq(qmc5883l.rate_read(d), 0)
+    test.assert_eq(qmc5883l.rate_write(d, 50), 50)
+    test.assert_eq(reg_of(c, 0x09), 0x14)
+    test.assert_eq(qmc5883l.rate_read(d), 0)
+    c.regs.insert(0x09, 0x11)
+    test.assert_eq(qmc5883l.rate_read(d), 10)
+    test.assert_eq(qmc5883l.rate_write(d, 150), 200)
+    test.assert_eq(reg_of(c, 0x09), 0x1D)
+    test.assert_eq(qmc5883l.rate_read(d), 200)
+    c.ro.insert(0x09, 1)
+    test.assert_eq(qmc5883l.rate_write(d, 10), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(qmc5883l.rate_read(d), 0)
+
+@test
+fn test_the_oversampling_ratio_is_written_leaving_the_other_fields() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x1D)
+    test.assert_eq(qmc5883l.osr_read(d), 512)
+    test.assert_eq(qmc5883l.osr_write(d, 64), 64)
+    test.assert_eq(reg_of(c, 0x09), 0xDD)
+    test.assert_eq(qmc5883l.osr_read(d), 64)
+    test.assert_eq(qmc5883l.osr_write(d, 200), 256)
+    test.assert_eq(reg_of(c, 0x09), 0x5D)
+    test.assert_eq(qmc5883l.osr_write(d, 9999), 512)
+    test.assert_eq(reg_of(c, 0x09), 0x1D)
+    c.ro.insert(0x09, 1)
+    test.assert_eq(qmc5883l.osr_write(d, 64), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(qmc5883l.osr_read(d), 512)
+
+@test
+fn test_the_ready_pin_is_enabled_by_clearing_int_enb_and_nothing_else_changes() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x0A, 0x40)
+    test.assert(qmc5883l.drdy_pin_write(d, false))
+    test.assert_eq(reg_of(c, 0x0A), 0x41)
+    test.assert(qmc5883l.drdy_pin_write(d, true))
+    test.assert_eq(reg_of(c, 0x0A), 0x40)
+    c.st.insert(4, 0)
+    test.assert(not qmc5883l.drdy_pin_write(d, true))
+    test.assert(not qmc5883l.drdy_pin_write(d, false))
+
+// ── The temperature ──────────────────────────────────────────────────
+
+@test
+fn test_the_temperature_is_a_change_of_100_counts_to_the_degree() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(milli_of(qmc5883l.temp_read_milli(d)), 0)
+    log_is(c, [2, 0x0D, 0x07, 2, -1])
+    put16(c, 0x07, 100)
+    test.assert_eq(milli_of(qmc5883l.temp_read_milli(d)), 1000)
+    put16(c, 0x07, -250)
+    test.assert_eq(milli_of(qmc5883l.temp_read_milli(d)), -2500)
+    c.st.insert(4, 0)
+    test.assert(qmc5883l.temp_read_milli(d) == None)
+
+@test
+fn test_a_temperature_start_is_refused_in_standby() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(qmc5883l.temp_begin(d), -1)
+    c.regs.insert(0x09, 0x01)
+    test.assert_eq(qmc5883l.temp_begin(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(qmc5883l.temp_begin(d), -1)
+
+// ── Waiting on a host's scheduler ────────────────────────────────────
+
+// A timer that records each sleep (`st[100]` their number, `st[101]` the last
+// length in microseconds).
+struct FakeTimer
+    c: Chip
+
+impl TimerAsync for FakeTimer
+    @tier(app)
+    async fn sleep_ms(self, ms: Int) [hw]
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, ms * 1000)
+
+    @tier(app)
+    async fn sleep_us(self, us: Int) [hw]
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, us)
+
+@test
+fn test_an_awaited_sample_parks_until_the_flag_is_set() [io, hw, async]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x01)
+    c.regs.insert(0x06, 0x01)
+    put_xyz(c, 12000, 0, 0)
+    // Two reads of STATUS answer not ready.
+    c.st.insert(50, 2)
+    let a = await qmc5883l.mag_next(d, FakeTimer { c: c }, 5000, 10)
+    test.assert_eq(at(c.st, 100), 2)
+    test.assert_eq(at(c.st, 101), 5000)
+    test.assert_eq(x_of(a), 100000)
+
+@test
+fn test_an_awaited_sample_that_never_comes_gives_nothing() [io, hw, async]
+    let c = chip()
+    let d = dut(c)
+    test.assert(is_none(await qmc5883l.mag_next(d, FakeTimer { c: c }, 1000, 3)))
+    test.assert_eq(at(c.st, 100), 3)
+
+// The DRDY pin as a board that edges are armed on delivers it: `st[110]` is the
+// pin armed, `st[111]` the edge, and a refusal is set with `st[112]`.
+struct FakeEdge
+    c: Chip
+
+impl AsyncEdge[hw] for FakeEdge
+    @tier(app)
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int [hw]
+        if at(self.c.st, 112) != 0
+            return -2
+        self.c.st.insert(110, pin)
+        self.c.st.insert(111, edge)
+        0
+
+    @tier(app)
+    fn edge_disarm(self, pin: Int) -> Bool [hw]
+        pin == at(self.c.st, 110)
+
+    @tier(app)
+    fn edge_irqs(self) -> Int [hw]
+        0
+
+@test
+fn test_the_ready_pin_is_armed_on_a_rising_edge_through_the_board() [io, hw]
+    let c = chip()
+    let f = core.rt.future_new()
+    test.assert_eq(qmc5883l.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), 0)
+    test.assert_eq(at(c.st, 110), 65)
+    test.assert_eq(at(c.st, 111), 0)
+    test.assert(qmc5883l.irq_disarm(FakeEdge { c: c }, i2c_wiring()))
+    c.st.insert(112, 1)
+    test.assert_eq(qmc5883l.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), -2)
+    let bare = dev_bus.wiring_i2c(0, 0x0D)
+    test.assert_eq(qmc5883l.irq_arm(FakeEdge { c: c }, bare, f), -1)
+    test.assert(not qmc5883l.irq_disarm(FakeEdge { c: c }, bare))
+    core.rt.future_drop(f)
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_soft_reset_sets_the_bit_and_polls_until_it_clears() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x1D)
+    c.regs.insert(0x0B, 0x01)
+    c.st.insert(44, 3)
+    c.st.insert(43, 0)
+    test.assert(qmc5883l.soft_reset(d))
+    writes_are(c, [0x0A, 0x80])
+    // Every control register is back at its reset value, the period among them.
+    test.assert_eq(reg_of(c, 0x09), 0)
+    test.assert_eq(reg_of(c, 0x0B), 0)
+
+@test
+fn test_a_soft_reset_that_never_clears_or_a_silent_part_fails() [io, hw]
+    let c = chip()
+    c.st.insert(44, -1)
+    test.assert(not qmc5883l.soft_reset(dut(c)))
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not qmc5883l.soft_reset(dut(c2)))
+    let c3 = chip()
+    c3.st.insert(70, 1)
+    test.assert(not qmc5883l.soft_reset(dut(c3)))
+
+@test
+fn test_the_bring_up_resets_writes_the_period_and_starts_continuous_mode() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x09, 0x1D)
+    c.st.insert(44, 2)
+    test.assert(qmc5883l.start(d))
+    // The soft reset, the SET/RESET period 0x01, then continuous mode at 10 Hz,
+    // ±2 gauss and 512 samples.  The pointer roll-over stays clear.
+    writes_are(c, [0x0A, 0x80, 0x0B, 0x01, 0x09, 0x01])
+    test.assert_eq(reg_of(c, 0x09), 0x01)
+    test.assert_eq(reg_of(c, 0x0A) & 0x40, 0)
+    test.assert_eq(reg_of(c, 0x0B), 0x01)
+    test.assert_eq(qmc5883l.rate_read(d), 10)
+    test.assert(qmc5883l.range_read(d) == QmcRange.QmcRange2G)
+    test.assert_eq(qmc5883l.osr_read(d), 512)
+
+@test
+fn test_a_part_with_another_chip_id_is_refused_before_anything_is_written() [io, hw]
+    let c = chip()
+    c.regs.insert(0x0D, 0x80)
+    test.assert(not qmc5883l.start(dut(c)))
+    writes_are(c, [])
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not qmc5883l.start(dut(c2)))
+
+@test
+fn test_a_part_that_refuses_a_setting_or_dies_ends_the_bring_up() [io, hw]
+    let c = chip()
+    c.ro.insert(0x0B, 1)
+    test.assert(not qmc5883l.start(dut(c)))
+    let c2 = chip()
+    c2.ro.insert(0x09, 1)
+    test.assert(not qmc5883l.start(dut(c2)))
+    let c3 = chip()
+    c3.st.insert(44, -1)
+    test.assert(not qmc5883l.start(dut(c3)))
+    // The part answers n transactions and goes silent, for each n short of a
+    // whole bring-up.
+    let whole = chip()
+    test.assert(qmc5883l.start(dut(whole)))
+    let total = transactions(whole)
+    for n in 1..total
+        let cn = chip()
+        cn.st.insert(70, n)
+        test.assert(not qmc5883l.start(dut(cn)))
+    let last = chip()
+    last.st.insert(70, total)
+    test.assert(qmc5883l.start(dut(last)))
+
+// ── The type ─────────────────────────────────────────────────────────
+//
+// The type is built over the host's board handles, which answer as absent
+// hardware here: each method answers its "no part" value.  This runs the lines
+// of the type that forward to the functions above.
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x0D)
+    let p = Qmc5883l.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0D) == None)
+    test.assert(not p.set_reg(0x0B, 1))
+    test.assert(p.range() == QmcRange.QmcRange2G)
+    test.assert(not p.set_range(QmcRange.QmcRange8G))
+    test.assert(p.mode() == QmcMode.QmcStandby)
+    test.assert(not p.set_mode(QmcMode.QmcContinuous))
+    test.assert_eq(p.set_rate_hz(50), 0)
+    test.assert_eq(p.oversampling(), 512)
+    test.assert_eq(p.set_oversampling(64), 0)
+    test.assert(not p.overflowed())
+    test.assert(not p.set_drdy_pin(true))
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(is_none(p.mag_read()))
+    test.assert(not p.mag_ready())
+    test.assert_eq(p.mag_rate_hz(), 0)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)

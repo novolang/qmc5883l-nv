@@ -66,8 +66,8 @@
 
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_mag.{ MagNanoT, Magnetometer }
-use dev_thermo.{ TempMilliC, Thermometer }
+use dev_mag.{ MagNanoT, MagRange, MagStatus, Magnetometer }
+use dev_thermo.{ TempMilliC, TempKind, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
@@ -214,6 +214,20 @@ pub fn rng_of_range(r: QmcRange) -> Int
         QmcRange2G => 0
         QmcRange8G => 1
 
+// The trait's range for the part's: `MagRange2G` or `MagRange8G`.
+pub fn mag_range_of(r: QmcRange) -> MagRange
+    match r
+        QmcRange2G => MagRange.MagRange2G
+        QmcRange8G => MagRange.MagRange8G
+
+// The part's range for the trait's, or `None` for a range the part does not
+// have: it measures at ±2 or ±8 gauss only.
+pub fn qmc_range_of(r: MagRange) -> ?QmcRange
+    match r
+        MagRange.MagRange2G => Some(QmcRange.QmcRange2G)
+        MagRange.MagRange8G => Some(QmcRange.QmcRange8G)
+        _                   => None
+
 // The counts per gauss of a range: 12000 at ±2 gauss, 3000 at ±8 (Table 2).
 pub fn counts_per_gauss(r: QmcRange) -> Int
     match r
@@ -314,6 +328,36 @@ pub fn sample_ready<P: Qmc5883lPort>(p: P) -> Bool [hw]
 pub fn overflow_read<P: Qmc5883lPort>(p: P) -> Bool [hw]
     status_overflow(status_read(p))
 
+// What STATUS says of the sample, in the trait's terms: `MagOverflow` when OVL is
+// set, since an axis then sits at -32768 or 32767; otherwise `MagNotReady` when
+// DRDY is clear, and `MagValid` when it is set.  A read of a data register clears
+// DRDY (§ 9.2.1.1), so the answer after a `mag_read` is `MagNotReady` until the
+// next sample completes; OVL is not cleared by that read.
+pub fn status_of(v: Int) -> MagStatus
+    if status_overflow(v)
+        return MagStatus.MagOverflow
+    if status_ready(v)
+        return MagStatus.MagValid
+    MagStatus.MagNotReady
+
+// The range from CTRL1 as the trait's, or `None` when the part did not answer.
+pub fn mag_range_read<P: Qmc5883lPort>(p: P) -> ?MagRange [hw]
+    match reg_read(p, CTRL1)
+        Some(v) => Some(mag_range_of(range_of_ctrl1(v)))
+        None    => None
+
+// Sets the range the trait names.  The part has two, so any other answers
+// `false` without a write.
+pub fn mag_range_write<P: Qmc5883lPort>(p: P, r: MagRange) -> Bool [hw]
+    match qmc_range_of(r)
+        Some(q) => range_write(p, q)
+        None    => false
+
+// STATUS read on its own, which clears nothing, in the trait's terms.  A part
+// that did not answer reads 0 and so is `MagNotReady`.
+pub fn mag_status_read<P: Qmc5883lPort>(p: P) -> MagStatus [hw]
+    status_of(status_read(p))
+
 // The range the part is set to, ±2 gauss when it does not answer.
 pub fn range_read<P: Qmc5883lPort>(p: P) -> QmcRange [hw]
     range_of_ctrl1(reg_read(p, CTRL1) ?? 0)
@@ -403,6 +447,10 @@ pub fn temp_begin<P: Qmc5883lPort>(p: P) -> Int [hw]
 // implemented by `Qmc5883l`.  A program at `@tier(embedded)` arms the DRDY pin
 // through `irq_arm` and the board's `AsyncEdge` instead.
 
+// Stays an inherent function: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5,
+// row "the async forms" (a `@value` driver cannot implement `MagnetometerAsync`,
+// and the embedded tier refuses `async fn`).
+//
 // Parks the task until the next sample is complete and answers it: the
 // data-ready flag is polled every `period_us`, at most `tries` times.  The part
 // measures in the background in continuous mode, so the task is free in
@@ -416,6 +464,9 @@ async fn mag_next<P: Qmc5883lPort, T: TimerAsync>(p: P, t: T, period_us: Int,
         await t.sleep_us(period_us)
     None
 
+// Stays an inherent function: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5,
+// row "the async forms" (no board's GPIO implements `AsyncEdge`).
+//
 // Arms the part's DRDY pin on a rising edge through a board's pin-edge source:
 // 0 when armed, a negative value when refused, and -1 for a wiring with no pin.
 // The edge resolves `f`.  The pin must be enabled, which `begin` leaves it.
@@ -502,14 +553,6 @@ impl Qmc5883l
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
         reg_write(self, r, v)
 
-    // The full-scale range.
-    fn range(self) -> QmcRange [hw]
-        range_read(self)
-
-    // Sets the full-scale range (`range_write`).
-    fn set_range(self, r: QmcRange) -> Bool [hw]
-        range_write(self, r)
-
     // The operation mode.
     fn mode(self) -> QmcMode [hw]
         mode_read(self)
@@ -530,10 +573,6 @@ impl Qmc5883l
     fn set_oversampling(self, n: Int) -> Int [hw]
         osr_write(self, n)
 
-    // Whether the last measurement had an axis out of range.
-    fn overflowed(self) -> Bool [hw]
-        overflow_read(self)
-
     // Turns the DRDY pin on or off (`drdy_pin_write`).
     fn set_drdy_pin(self, on: Bool) -> Bool [hw]
         drdy_pin_write(self, on)
@@ -548,7 +587,20 @@ impl Magnetometer[hw] for Qmc5883l
     fn mag_rate_hz(self) -> Int [hw]
         rate_read(self)
 
+    fn mag_range(self) -> ?MagRange [hw]
+        mag_range_read(self)
+
+    fn mag_set_range(self, r: MagRange) -> Bool [hw]
+        mag_range_write(self, r)
+
+    fn mag_status(self) -> MagStatus [hw]
+        mag_status_read(self)
+
 impl Thermometer[hw] for Qmc5883l
+    // The offset is not compensated (§ 12.2.3): the reading shows change only.
+    fn temp_kind(self) -> TempKind [hw]
+        TempKind.TempRelative
+
     fn temp_start(self) -> Int [hw]
         temp_begin(self)
 

@@ -14,8 +14,8 @@
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_mag.{ MagNanoT, Magnetometer }
-use dev_thermo.{ TempMilliC, Thermometer }
+use dev_mag.{ MagNanoT, MagRange, MagStatus, Magnetometer }
+use dev_thermo.{ TempMilliC, TempKind, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 use qmc5883l
 use qmc5883l.{ Qmc5883l, QmcRange, QmcMode, Qmc5883lPort }
@@ -560,6 +560,79 @@ fn test_the_range_is_bits_5_and_4_and_leaves_the_rate_alone() [io, hw]
     c.st.insert(4, 0)
     test.assert(qmc5883l.range_read(d) == QmcRange.QmcRange2G)
 
+// ── The trait's range and status ─────────────────────────────────────
+
+// Whether `o` holds the range `want`; a match, since `==` between an `?QmcRange`
+// and a `Some` answered false in this suite.
+@tier(app)
+fn is_q(o: ?QmcRange, want: QmcRange) -> Bool
+    match o
+        Some(q) => q == want
+        None    => false
+
+@test
+fn test_the_trait_s_range_maps_onto_the_part_s_two_ranges() [io, hw]
+    test.assert(qmc5883l.mag_range_of(QmcRange.QmcRange2G) == MagRange.MagRange2G)
+    test.assert(qmc5883l.mag_range_of(QmcRange.QmcRange8G) == MagRange.MagRange8G)
+    test.assert(is_q(qmc5883l.qmc_range_of(MagRange.MagRange2G), QmcRange.QmcRange2G))
+    test.assert(is_q(qmc5883l.qmc_range_of(MagRange.MagRange8G), QmcRange.QmcRange8G))
+    test.assert(qmc5883l.qmc_range_of(MagRange.MagRange4G) == None)
+    test.assert(qmc5883l.qmc_range_of(MagRange.MagRange12G) == None)
+    test.assert(qmc5883l.qmc_range_of(MagRange.MagRange16G) == None)
+
+@test
+fn test_mag_range_reads_ctrl1_and_mag_set_range_writes_only_the_range_field() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // 50 Hz, continuous, ±2 gauss.
+    c.regs.insert(0x09, 0x05)
+    test.assert(qmc5883l.mag_range_read(d) == Some(MagRange.MagRange2G))
+    test.assert(qmc5883l.mag_range_write(d, MagRange.MagRange8G))
+    test.assert_eq(reg_of(c, 0x09), 0x15)
+    test.assert(qmc5883l.mag_range_read(d) == Some(MagRange.MagRange8G))
+    test.assert(qmc5883l.mag_range_write(d, MagRange.MagRange2G))
+    test.assert_eq(reg_of(c, 0x09), 0x05)
+    c.ro.insert(0x09, 1)
+    test.assert(not qmc5883l.mag_range_write(d, MagRange.MagRange8G))
+    c.ro.insert(0x09, 0)
+    // The part has no ±4, ±12 or ±16 gauss range: nothing is written.
+    writes_are(c, [0x09, 0x15, 0x09, 0x05, 0x09, 0x15])
+    test.assert(not qmc5883l.mag_range_write(d, MagRange.MagRange4G))
+    test.assert(not qmc5883l.mag_range_write(d, MagRange.MagRange12G))
+    test.assert(not qmc5883l.mag_range_write(d, MagRange.MagRange16G))
+    writes_are(c, [])
+    test.assert_eq(reg_of(c, 0x09), 0x05)
+
+@test
+fn test_the_status_is_overflow_before_not_ready_and_valid_when_ready() [io, hw]
+    test.assert(qmc5883l.status_of(0x00) == MagStatus.MagNotReady)
+    test.assert(qmc5883l.status_of(0x01) == MagStatus.MagValid)
+    test.assert(qmc5883l.status_of(0x02) == MagStatus.MagOverflow)
+    test.assert(qmc5883l.status_of(0x03) == MagStatus.MagOverflow)
+    // DOR alone says data was skipped, not that the sample is bad.
+    test.assert(qmc5883l.status_of(0x05) == MagStatus.MagValid)
+    test.assert(qmc5883l.status_of(0x04) == MagStatus.MagNotReady)
+
+@test
+fn test_mag_status_reads_status_alone_and_a_data_read_clears_the_ready_flag() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    c.regs.insert(0x06, 0x01)
+    test.assert(qmc5883l.mag_status_read(d) == MagStatus.MagValid)
+    log_clear(c)
+    c.regs.insert(0x06, 0x03)
+    test.assert(qmc5883l.mag_status_read(d) == MagStatus.MagOverflow)
+    log_is(c, [2, 0x0D, 0x06, 1, -1])
+    // A data read clears DRDY, so the next answer is not ready; OVL stays.
+    c.regs.insert(0x06, 0x01)
+    test.assert(not is_none(qmc5883l.sample_read(d)))
+    test.assert(qmc5883l.mag_status_read(d) == MagStatus.MagNotReady)
+    c.regs.insert(0x06, 0x03)
+    test.assert(not is_none(qmc5883l.sample_read(d)))
+    test.assert(qmc5883l.mag_status_read(d) == MagStatus.MagOverflow)
+    c.st.insert(4, 0)
+    test.assert(qmc5883l.mag_status_read(d) == MagStatus.MagNotReady)
+
 @test
 fn test_the_mode_is_written_leaving_the_other_fields() [io, hw]
     let c = chip()
@@ -818,14 +891,15 @@ fn test_the_type_over_absent_hardware() [io, hw]
     test.assert(not p.begin())
     test.assert(p.reg(0x0D) == None)
     test.assert(not p.set_reg(0x0B, 1))
-    test.assert(p.range() == QmcRange.QmcRange2G)
-    test.assert(not p.set_range(QmcRange.QmcRange8G))
+    test.assert(p.mag_range() == None)
+    test.assert(not p.mag_set_range(MagRange.MagRange8G))
     test.assert(p.mode() == QmcMode.QmcStandby)
     test.assert(not p.set_mode(QmcMode.QmcContinuous))
     test.assert_eq(p.set_rate_hz(50), 0)
     test.assert_eq(p.oversampling(), 512)
     test.assert_eq(p.set_oversampling(64), 0)
-    test.assert(not p.overflowed())
+    test.assert(p.mag_status() == MagStatus.MagNotReady)
+    test.assert(p.temp_kind() == TempKind.TempRelative)
     test.assert(not p.set_drdy_pin(true))
     test.assert_eq(p.irq_level(), -1)
     test.assert(is_none(p.mag_read()))

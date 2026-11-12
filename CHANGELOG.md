@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+
+- `Qmc5883l.range()` and `set_range(r)` are now the `Magnetometer` methods `mag_range()`
+  and `mag_set_range(r)`, which answer and take `MagRange2G` and `MagRange8G`; any other
+  `MagRange` answers `false` and writes nothing.  `mag_range()` answers `None` when the
+  part does not answer, where `range()` answered ±2 gauss.  The module functions
+  `range_read` and `range_write` stay.
+- `Qmc5883l.overflowed()` is now `Magnetometer.mag_status()`: `MagOverflow` when OVL is
+  set, `MagNotReady` when DRDY is clear, `MagValid` otherwise.  After a data read DRDY is
+  clear, so the answer is `MagNotReady` until the next sample.  `overflow_read` stays.
+- `Thermometer.temp_kind()` answers `TempRelative`.
+- New module functions `mag_range_read`, `mag_range_write`, `mag_status_read`, `status_of`,
+  `mag_range_of` and `qmc_range_of`.
+
 ## 0.1.0
 
 The first release: a driver for QST's QMC5883L three-axis magnetometer on an I2C bus.

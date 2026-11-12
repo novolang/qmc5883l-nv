@@ -148,12 +148,13 @@ and the wiring, as a board's device table builds it.  It implements `Magnetomete
 | `mag_read()`, `mag_ready()`, `mag_read_new()` | `Magnetometer`: the latest sample in nanotesla, the data-ready flag, a sample not read before |
 | `mag_rate_hz()` | the rate in continuous mode; 0 in standby |
 | `temp_start()`, `temp_read()` | `Thermometer`: the part converts with its measurements, so a start answers 0, or -1 in standby; a reading is a change, see the rules |
+| `mag_range()`, `mag_set_range(r)` | `Magnetometer`: the full scale as `MagRange2G` or `MagRange8G`, changed without touching the other fields of CTRL1; any other range answers `false` and writes nothing |
+| `mag_status()` | `Magnetometer`: `MagOverflow` when OVL is set, `MagNotReady` when DRDY is clear, `MagValid` otherwise; STATUS is read on its own |
+| `temp_kind()` | `Thermometer`: `TempRelative`, since the reading has no fixed zero |
 | `device_id()` | `Identifiable`: the chip id, 0xFF |
-| `range()`, `set_range(r)` | the full scale, changed without touching the other fields of CTRL1 |
 | `mode()`, `set_mode(m)` | standby or continuous |
 | `set_rate_hz(hz)` | the slowest rate at or above `hz`, answering the rate taken |
 | `oversampling()`, `set_oversampling(n)` | the ratio, and the smallest ratio at or above `n` |
-| `overflowed()` | whether an axis of the last measurement was out of range |
 | `set_drdy_pin(on)` | the DRDY pin on or off |
 | `reg(r)`, `set_reg(r, v)` | one register, and a write that is read back |
 
@@ -191,15 +192,18 @@ VERIFIED on a board.
    The driver always reads all six, in one burst with STATUS, the temperature and CTRL1.
    The ready flag is read from STATUS alone, which does not clear it.
 4. STATUS in the sample burst is read after the data, so its DRDY and DOR bits are
-   already clear there.  `overflowed()` and `status_read` read it on its own.
+   already clear there.  `mag_status()` and `status_read` read it on its own.  A data read
+   clears DRDY, so `mag_status()` after a `mag_read()` answers `MagNotReady` until the next
+   sample completes; OVL is not cleared by that read, so an overflow stays visible.
 5. CTRL2's pointer roll-over (ROL_PNT) makes a read that begins at 0x00 to 0x06 wrap from
    0x06 to 0x00, so a burst that goes on to the temperature and CTRL1 would return the
    data twice.  The driver leaves it clear.
 6. A sample is converted at the range it was taken in, because CTRL1 is in the same
    burst.  A saturated count is converted as the count it saturated at: the field is
-   beyond the range, and `overflowed()` says so.
+   beyond the range, and `mag_status()` says `MagOverflow`.
 7. The temperature is the count times ten, in milli-degrees, with no fixed zero: only a
-   difference between two readings is a temperature change.
+   difference between two readings is a temperature change.  `temp_kind()` answers
+   `TempRelative` for it.
 8. CTRL2's INT_ENB is 1 for the pin disabled and 0 for enabled, as Rev. 1.0 words it.  The
    reset leaves the pin enabled, and so does `begin`; `set_drdy_pin(false)` disables it.
 9. After a soft reset every register is back at its reset value: standby, ±2 gauss, 10
@@ -217,6 +221,15 @@ VERIFIED on a board.
   and the undocumented "A" version of the QMC5883L that flight-controller code mentions.
   Modules sold as GY-271 carry one or the other.
 - A conversion of the temperature to an absolute value.
+
+## Where the traits fall short
+
+The gaps that remain for this driver:
+
+- `MagnetometerAsync` cannot be implemented by a `@value` driver (SPEC section 14.5) and
+  the embedded tier refuses `async fn`, so `mag_next` stays a free `@tier(rt)` function
+  over a `TimerAsync`.
+- No board's GPIO implements `AsyncEdge`, so `irq_arm` and `irq_disarm` have no source.
 
 ## Related packages
 

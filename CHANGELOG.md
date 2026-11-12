@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+The release depends on devices-nv 0.4.0 and embedded-hal-nv 0.4.0.
 
 - `Qmc5883l.range()` and `set_range(r)` are now the `Magnetometer` methods `mag_range()`
   and `mag_set_range(r)`, which answer and take `MagRange2G` and `MagRange8G`; any other

@@ -13,7 +13,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, TimerAsync, AsyncEdge }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_mag.{ MagNanoT, MagRange, MagStatus, Magnetometer }
 use dev_thermo.{ TempMilliC, TempKind, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
@@ -196,11 +196,7 @@ struct I2cDut
     pins: FakePins
     w: DeviceWiring
 
-impl Qmc5883lPort for I2cDut
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        qmc5883l.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for I2cDut
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         qmc5883l.i2c_read_into(self.bus, self.w, reg, n, var dst)
@@ -208,6 +204,11 @@ impl Qmc5883lPort for I2cDut
     @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         qmc5883l.i2c_write(self.bus, self.w, reg, v)
+
+impl Qmc5883lPort for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        qmc5883l.i2c_setup(self.bus, self.pins, self.w)
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -302,7 +303,7 @@ fn milli_of(o: ?TempMilliC) -> Int
 fn test_a_read_of_one_register_sends_the_bare_register() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert_eq(qmc5883l.reg_read(d, 0x0D) ?? -1, 0xFF)
+    test.assert_eq(d.read_reg(0x0D) ?? -1, 0xFF)
     log_is(c, [2, 0x0D, 0x0D, 1, -1])
 
 @test
@@ -330,9 +331,9 @@ fn test_a_missing_part_does_not_answer() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = dut(c)
-    test.assert(qmc5883l.reg_read(d, 0x0D) == None)
+    test.assert(d.read_reg(0x0D) == None)
     test.assert(not d.write_reg(0x0B, 1))
-    test.assert(not qmc5883l.reg_write(d, 0x0B, 1))
+    test.assert(not d.write_reg_verified(0x0B, 1))
     test.assert(qmc5883l.id_read(d) == None)
 
 @test
@@ -535,14 +536,14 @@ fn test_an_update_changes_only_the_bits_of_its_mask() [io, hw]
     let c = chip()
     let d = dut(c)
     c.regs.insert(0x09, 0xAA)
-    test.assert(qmc5883l.reg_update(d, 0x09, 0x0F, 0xFF))
+    test.assert(d.update_reg_verified(0x09, 0x0F, 0xFF))
     test.assert_eq(reg_of(c, 0x09), 0xAF)
-    test.assert(qmc5883l.reg_update(d, 0x09, 0xF0, 0x00))
+    test.assert(d.update_reg_verified(0x09, 0xF0, 0x00))
     test.assert_eq(reg_of(c, 0x09), 0x0F)
     c.ro.insert(0x09, 1)
-    test.assert(not qmc5883l.reg_update(d, 0x09, 0xF0, 0xF0))
+    test.assert(not d.update_reg_verified(0x09, 0xF0, 0xF0))
     c.st.insert(4, 0)
-    test.assert(not qmc5883l.reg_update(d, 0x09, 0xF0, 0xF0))
+    test.assert(not d.update_reg_verified(0x09, 0xF0, 0xF0))
 
 @test
 fn test_the_range_is_bits_5_and_4_and_leaves_the_rate_alone() [io, hw]
@@ -908,3 +909,13 @@ fn test_the_type_over_absent_hardware() [io, hw]
     test.assert_eq(p.temp_start(), -1)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(qmc5883l.reg_read(d, 0x0D), d.read_reg(0x0D))
+    test.assert_eq(qmc5883l.reg_write(d, 0x0D, 0x01), d.write_reg_verified(0x0D, 0x01))
+    test.assert_eq(qmc5883l.reg_update(d, 0x0D, 0x0F, 0x01), d.update_reg_verified(0x0D, 0x0F, 0x01))

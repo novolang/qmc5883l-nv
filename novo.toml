@@ -1,6 +1,6 @@
 [package]
 name        = "qmc5883l-nv"
-version     = "0.2.0"
+version     = "0.3.0"
 description = "A driver for QST's QMC5883L three-axis magnetometer on an I2C bus: the magnetic field in nanotesla at the 2 and 8 gauss ranges, the output data rates, the oversampling ratios, the data-ready line and the overflow and skipped-data flags, the die temperature as a change, and the chip id, as devices-nv's Magnetometer, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -27,4 +27,4 @@ tier = "embedded"
 embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Magnetometer, Thermometer and Identifiable traits.
-devices-nv      = "^0.4.0"
+devices-nv      = "^0.4.1"

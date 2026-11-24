@@ -133,7 +133,7 @@ read, and a read is a write of the register and a repeated start.
 
 | Module | What is in it |
 |---|---|
-| `qmc5883l` | The type `Qmc5883l` (I2C), `QmcRange`, `QmcMode`, the trait `Qmc5883lPort`, the bus framing, the register access, the conversions, the settings, the temperature, the awaiting function and the bring-up |
+| `qmc5883l` | The type `Qmc5883l` (I2C), `QmcRange`, `QmcMode`, the trait `Qmc5883lPort` over devices-nv's `RegPort`, the bus framing, the register access, the conversions, the settings, the temperature, the awaiting function and the bring-up |
 
 ## How to choose an entry point
 
@@ -158,8 +158,7 @@ and the wiring, as a board's device table builds it.  It implements `Magnetomete
 | `set_drdy_pin(on)` | the DRDY pin on or off |
 | `reg(r)`, `set_reg(r, v)` | one register, and a write that is read back |
 
-A program that holds its own bus, or a test with a double of the part, implements
-`Qmc5883lPort` over its bus and calls the module's functions, which take the port:
+A program that holds its own bus, or a test with a double of the part, implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Qmc5883lPort` over its bus and calls the module's functions, which take the port:
 `qmc5883l.sample_read(port)`, `qmc5883l.start(port)`.  The framing is `i2c_read_into` and
 `i2c_write`, generic over `I2cBus`.  `status_read(port)` answers STATUS whole and
 `status_ready`, `status_overflow` and `status_missed` test its bits.
